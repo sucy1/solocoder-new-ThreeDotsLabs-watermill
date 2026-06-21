@@ -1,0 +1,47 @@
+services:
+  webhooks-server:
+    image: golang:1.25
+    restart: unless-stopped
+    volumes:
+    - .:/app
+    - $GOPATH/pkg/mod:/go/pkg/mod
+    working_dir: /app/webhooks-server/
+    command: go run main.go
+
+  router:
+    image: golang:1.25
+    restart: unless-stopped
+    depends_on:
+      - kafka
+    volumes:
+    - .:/app
+    - $GOPATH/pkg/mod:/go/pkg/mod
+    working_dir: /app/router/
+    command: go run main.go
+
+  producer:
+    image: golang:1.25
+    restart: unless-stopped
+    depends_on:
+    - kafka
+    - webhooks-server
+    - router
+    volumes:
+    - .:/app
+    - $GOPATH/pkg/mod:/go/pkg/mod
+    working_dir: /app/producer/
+    command: go run main.go
+
+  kafka:
+    image: redpandadata/redpanda:v26.1.7
+    restart: unless-stopped
+    logging:
+      driver: none
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://kafka:9092,external://localhost:19092
+      - --mode dev-container
+      - --smp 1
+      - --default-log-level=warn

@@ -1,0 +1,36 @@
+services:
+  server:
+    image: golang:1.25
+    restart: unless-stopped
+    depends_on:
+      - mysql
+    volumes:
+      - .:/app
+      - $GOPATH/pkg/mod:/go/pkg/mod
+    working_dir: /app
+    command: > 
+      /bin/sh -c "go install github.com/ThreeDotsLabs/watermill/tools/mill@latest &&
+                  go run main.go"
+
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    ports:
+      - 3306:3306
+    environment:
+      MYSQL_DATABASE: watermill
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+
+  kafka:
+    image: redpandadata/redpanda:v26.1.7
+    logging:
+      driver: none
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://kafka:9092,external://localhost:19092
+      - --mode dev-container
+      - --smp 1
+      - --default-log-level=warn
