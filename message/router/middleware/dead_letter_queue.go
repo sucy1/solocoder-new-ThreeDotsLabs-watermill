@@ -14,10 +14,21 @@ const (
 	DLQOriginalHandlerKey = "dlq_original_handler"
 )
 
+type DLQPublishFailedFunc func(msg *message.Message, handlerErr error, dlqPublishErr error) ([]*message.Message, error)
+
+func LogOnDLQPublishFailed(msg *message.Message, handlerErr error, dlqPublishErr error) ([]*message.Message, error) {
+	return nil, errors.Wrap(handlerErr, "DLQ publish also failed: "+dlqPublishErr.Error())
+}
+
+func NackOnDLQPublishFailed(msg *message.Message, handlerErr error, dlqPublishErr error) ([]*message.Message, error) {
+	return nil, errors.Wrap(handlerErr, "DLQ publish also failed: "+dlqPublishErr.Error())
+}
+
 type DeadLetterQueue struct {
-	publisher message.Publisher
-	topic     string
-	logger    watermill.LoggerAdapter
+	publisher           message.Publisher
+	topic               string
+	logger              watermill.LoggerAdapter
+	OnDLQPublishFailed  DLQPublishFailedFunc
 }
 
 func NewDeadLetterQueue(publisher message.Publisher, topic string, logger watermill.LoggerAdapter) *DeadLetterQueue {
@@ -25,9 +36,10 @@ func NewDeadLetterQueue(publisher message.Publisher, topic string, logger waterm
 		logger = watermill.NopLogger{}
 	}
 	return &DeadLetterQueue{
-		publisher: publisher,
-		topic:     topic,
-		logger:    logger,
+		publisher:          publisher,
+		topic:              topic,
+		logger:             logger,
+		OnDLQPublishFailed: LogOnDLQPublishFailed,
 	}
 }
 
@@ -52,6 +64,10 @@ func (dlq *DeadLetterQueue) Middleware(h message.HandlerFunc) message.HandlerFun
 					"message_uuid": msg.UUID,
 					"dlq_topic":    dlq.topic,
 				})
+
+				if dlq.OnDLQPublishFailed != nil {
+					return dlq.OnDLQPublishFailed(msg, err, publishErr)
+				}
 				return producedMessages, errors.Wrap(err, "failed to send to DLQ: "+publishErr.Error())
 			}
 

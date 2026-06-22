@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -53,6 +55,58 @@ func TestDeadLetterQueue_Middleware_NoError(t *testing.T) {
 	assert.Empty(t, pub.publishedMessages)
 }
 
+func TestDeadLetterQueue_OnDLQPublishFailed(t *testing.T) {
+	handlerErr := errors.New("handler failed")
+	dlqPublishErr := errors.New("dlq publish failed")
+
+	pub := &failingPublisher{err: dlqPublishErr}
+
+	fallbackCalled := false
+	fallbackMsg := message.NewMessage(watermill.NewUUID(), []byte("fallback"))
+
+	dlq := NewDeadLetterQueue(pub, "dlq-topic", watermill.NopLogger{})
+	dlq.OnDLQPublishFailed = func(msg *message.Message, hErr error, pErr error) ([]*message.Message, error) {
+		fallbackCalled = true
+		assert.Equal(t, handlerErr, hErr)
+		assert.Equal(t, dlqPublishErr, pErr)
+		return []*message.Message{fallbackMsg}, nil
+	}
+
+	handler := dlq.Middleware(func(msg *message.Message) ([]*message.Message, error) {
+		return nil, handlerErr
+	})
+
+	msg := message.NewMessage(watermill.NewUUID(), []byte("payload"))
+
+	produced, err := handler(msg)
+
+	require.NoError(t, err)
+	assert.True(t, fallbackCalled)
+	require.Len(t, produced, 1)
+	assert.Equal(t, fallbackMsg.UUID, produced[0].UUID)
+}
+
+func TestDeadLetterQueue_OnDLQPublishFailed_DefaultBehavior(t *testing.T) {
+	handlerErr := errors.New("handler failed")
+	dlqPublishErr := errors.New("dlq publish failed")
+
+	pub := &failingPublisher{err: dlqPublishErr}
+
+	dlq := NewDeadLetterQueue(pub, "dlq-topic", watermill.NopLogger{})
+
+	handler := dlq.Middleware(func(msg *message.Message) ([]*message.Message, error) {
+		return nil, handlerErr
+	})
+
+	msg := message.NewMessage(watermill.NewUUID(), []byte("payload"))
+
+	_, err := handler(msg)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "handler failed")
+	assert.Contains(t, err.Error(), "dlq publish failed")
+}
+
 func TestRetryWithDLQ_Middleware(t *testing.T) {
 	pub := &mockPublisher{}
 	dlq := NewDeadLetterQueue(pub, "dlq-topic", watermill.NopLogger{})
@@ -82,6 +136,94 @@ func TestRetryWithDLQ_Middleware(t *testing.T) {
 	assert.Empty(t, produced)
 	assert.Equal(t, 2, attempts)
 	assert.Len(t, pub.publishedMessages, 1)
+}
+
+func TestRateLimitMiddleware_AllowsWithinLimit(t *testing.T) {
+	limiter := RateLimitMiddleware(RateLimitConfig{
+		MessagesPerSecond: 100,
+		Burst:             10,
+	}, watermill.NopLogger{})
+
+	processed := 0
+	handler := limiter(func(msg *message.Message) ([]*message.Message, error) {
+		processed++
+		return nil, nil
+	})
+
+	msg := message.NewMessage(watermill.NewUUID(), []byte("payload"))
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	msg.SetContext(ctx)
+
+	_, err := handler(msg)
+	require.NoError(t, err)
+	assert.Equal(t, 1, processed)
+}
+
+func TestRateLimitMiddleware_BlocksExceedingLimit(t *testing.T) {
+	limiter := RateLimitMiddleware(RateLimitConfig{
+		MessagesPerSecond: 1,
+		Burst:             1,
+	}, watermill.NopLogger{})
+
+	processed := 0
+	handler := limiter(func(msg *message.Message) ([]*message.Message, error) {
+		processed++
+		return nil, nil
+	})
+
+	msg1 := message.NewMessage(watermill.NewUUID(), []byte("payload1"))
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel1()
+	msg1.SetContext(ctx1)
+
+	_, err := handler(msg1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, processed)
+
+	msg2 := message.NewMessage(watermill.NewUUID(), []byte("payload2"))
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	msg2.SetContext(ctx2)
+
+	start := time.Now()
+	_, err = handler(msg2)
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+	assert.Equal(t, 2, processed)
+	assert.True(t, elapsed >= 900*time.Millisecond, "second message should have been delayed, took %v", elapsed)
+}
+
+func TestConsumerGroupRateLimiter_LogicNotInverted(t *testing.T) {
+	cg := NewConsumerGroupRateLimiter()
+	mw := cg.Middleware("test-group", 1, 1, 0, watermill.NopLogger{})
+
+	processed := 0
+	handler := mw(func(msg *message.Message) ([]*message.Message, error) {
+		processed++
+		return nil, nil
+	})
+
+	msg1 := message.NewMessage(watermill.NewUUID(), []byte("1"))
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel1()
+	msg1.SetContext(ctx1)
+
+	_, err := handler(msg1)
+	require.NoError(t, err)
+	assert.Equal(t, 1, processed)
+
+	msg2 := message.NewMessage(watermill.NewUUID(), []byte("2"))
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel2()
+	msg2.SetContext(ctx2)
+
+	start := time.Now()
+	_, err = handler(msg2)
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+	assert.Equal(t, 2, processed)
+	assert.True(t, elapsed >= 900*time.Millisecond, "rate-limited message should have been delayed, took %v", elapsed)
 }
 
 func TestHeaderPropagation_Middleware(t *testing.T) {
@@ -163,5 +305,17 @@ func (m *mockPublisher) Publish(topic string, messages ...*message.Message) erro
 }
 
 func (m *mockPublisher) Close() error {
+	return nil
+}
+
+type failingPublisher struct {
+	err error
+}
+
+func (f *failingPublisher) Publish(topic string, messages ...*message.Message) error {
+	return f.err
+}
+
+func (f *failingPublisher) Close() error {
 	return nil
 }

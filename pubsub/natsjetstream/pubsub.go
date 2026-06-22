@@ -3,6 +3,7 @@ package natsjetstream
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +23,7 @@ type JetStreamConfig struct {
 	TrackMsgId       bool
 	AckAsync         bool
 	DurablePrefix    string
+	DeliverSubjectPrefix string
 }
 
 type SubscriberConfig struct {
@@ -32,7 +34,7 @@ type SubscriberConfig struct {
 	Unmarshaler    Unmarshaler
 	JetStream      JetStreamConfig
 	QueueGroup     string
-	RateLimit      float64
+	RateLimit      uint64
 }
 
 type PublisherConfig struct {
@@ -58,6 +60,24 @@ func (c *PublisherConfig) setDefaults() {
 	if c.Marshaler == nil {
 		c.Marshaler = &GobMarshaler{}
 	}
+}
+
+func stableDeliverSubject(prefix, topic, queueGroup string) string {
+	p := prefix
+	if p == "" {
+		p = "$JS.watermill.deliver"
+	}
+	if queueGroup != "" {
+		return fmt.Sprintf("%s.%s.%s", p, sanitizeSubjectPart(queueGroup), sanitizeSubjectPart(topic))
+	}
+	return fmt.Sprintf("%s.%s", p, sanitizeSubjectPart(topic))
+}
+
+func sanitizeSubjectPart(s string) string {
+	s = strings.ReplaceAll(s, ">", "_")
+	s = strings.ReplaceAll(s, "*", "_")
+	s = strings.ReplaceAll(s, " ", "_")
+	return s
 }
 
 type Subscriber struct {
@@ -151,6 +171,9 @@ func (s *Subscriber) consumeMessages(ctx context.Context, topic string, sub *sub
 	var err error
 
 	subscribeOpts := append([]nats.SubOpt{}, s.config.JetStream.SubscribeOptions...)
+
+	deliverSubject := stableDeliverSubject(s.config.JetStream.DeliverSubjectPrefix, topic, s.config.QueueGroup)
+	subscribeOpts = append(subscribeOpts, nats.DeliverSubject(deliverSubject))
 
 	if s.config.QueueGroup != "" {
 		if s.config.JetStream.DurablePrefix != "" {
