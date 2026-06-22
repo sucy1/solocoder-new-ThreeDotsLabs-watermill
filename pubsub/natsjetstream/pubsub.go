@@ -104,6 +104,7 @@ type subscriber struct {
 	messages chan *message.Message
 	closed   bool
 	closedMu sync.Mutex
+	key      string
 }
 
 func NewSubscriber(config SubscriberConfig, logger watermill.LoggerAdapter) (*Subscriber, error) {
@@ -140,6 +141,16 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 		return nil, errors.New("subscriber closed")
 	}
 
+	subscriberKey := s.subscriberKey(topic)
+	s.subscribersLock.Lock()
+	if _, exists := s.subscribers[subscriberKey]; exists {
+		s.subscribersLock.Unlock()
+		return nil, errors.Errorf(
+			"subscriber for topic %q (queue %q) already exists; cannot overwrite an active subscription",
+			topic, s.config.QueueGroup,
+		)
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 
 	output := make(chan *message.Message)
@@ -148,10 +159,10 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 		ctx:      ctx,
 		cancel:   cancel,
 		messages: output,
+		key:      subscriberKey,
 	}
 
-	s.subscribersLock.Lock()
-	s.subscribers[topic] = sub
+	s.subscribers[subscriberKey] = sub
 	s.subscribersLock.Unlock()
 
 	s.subsWg.Add(1)
@@ -159,9 +170,20 @@ func (s *Subscriber) Subscribe(ctx context.Context, topic string) (<-chan *messa
 	go func() {
 		defer s.subsWg.Done()
 		s.consumeMessages(ctx, topic, sub, output)
+
+		s.subscribersLock.Lock()
+		delete(s.subscribers, subscriberKey)
+		s.subscribersLock.Unlock()
 	}()
 
 	return output, nil
+}
+
+func (s *Subscriber) subscriberKey(topic string) string {
+	if s.config.QueueGroup != "" {
+		return fmt.Sprintf("%s:%s", s.config.QueueGroup, topic)
+	}
+	return topic
 }
 
 func (s *Subscriber) consumeMessages(ctx context.Context, topic string, sub *subscriber, output chan *message.Message) {
@@ -273,7 +295,8 @@ func (s *Subscriber) Close() error {
 	close(s.closing)
 
 	s.subscribersLock.Lock()
-	for _, sub := range s.subscribers {
+	for key, sub := range s.subscribers {
+		s.logger.Debug("Canceling subscriber", watermill.LogFields{"subscriber_key": key})
 		if sub.cancel != nil {
 			sub.cancel()
 		}

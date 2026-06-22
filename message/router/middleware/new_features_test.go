@@ -3,6 +3,8 @@ package middleware
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -289,6 +291,132 @@ func TestPropagateAllHeaders_Middleware(t *testing.T) {
 	assert.Equal(t, "trace-123", produced[0].Metadata.Get("X-Trace-ID"))
 	assert.Equal(t, "req-456", produced[0].Metadata.Get("X-Request-ID"))
 	assert.Equal(t, "", produced[0].Metadata.Get("X-Secret"))
+}
+
+func TestRateLimitMiddleware_SlidingWindow_NoDoubleBurst(t *testing.T) {
+	limiter := NewSlidingWindowLimiter(200*time.Millisecond, 3)
+
+	now := time.Unix(0, 0)
+
+	assert.True(t, limiter.Reserve(now), "1st should be allowed")
+	assert.True(t, limiter.Reserve(now.Add(50*time.Millisecond)), "2nd should be allowed")
+	assert.True(t, limiter.Reserve(now.Add(100*time.Millisecond)), "3rd should be allowed")
+	assert.False(t, limiter.Reserve(now.Add(150*time.Millisecond)), "4th at 150ms should NOT be allowed (still 3 in window)")
+
+	assert.True(t, limiter.Reserve(now.Add(201*time.Millisecond)),
+		"at 201ms, 1st request falls out of window, should be allowed again")
+	assert.False(t, limiter.Reserve(now.Add(205*time.Millisecond)),
+		"at 205ms, window still has 3 requests, should NOT allow")
+}
+
+func TestRateLimitMiddleware_SlidingWindowConfig(t *testing.T) {
+	mw := RateLimitMiddleware(RateLimitConfig{
+		WindowSize:       200 * time.Millisecond,
+		MaxPerWindow:     2,
+		UseSlidingWindow: true,
+	}, watermill.NopLogger{})
+
+	processed := 0
+	handler := mw(func(msg *message.Message) ([]*message.Message, error) {
+		processed++
+		return nil, nil
+	})
+
+	start := time.Now()
+	for i := 0; i < 4; i++ {
+		msg := message.NewMessage(watermill.NewUUID(), []byte("payload"))
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+		msg.SetContext(ctx)
+
+		_, err := handler(msg)
+		require.NoError(t, err)
+	}
+	elapsed := time.Since(start)
+
+	assert.Equal(t, 4, processed)
+	assert.True(t, elapsed >= 200*time.Millisecond, "4 messages with 2/200ms window should take >=200ms, took %v", elapsed)
+}
+
+func TestDeadLetterQueue_LocalFileOnDLQPublishFailed(t *testing.T) {
+	tempDir := t.TempDir()
+
+	handlerErr := errors.New("handler failed")
+	dlqPublishErr := errors.New("dlq publish failed")
+	pub := &failingPublisher{err: dlqPublishErr}
+
+	dlq := NewDeadLetterQueue(pub, "dlq-topic", watermill.NopLogger{})
+	dlq.OnDLQPublishFailed = LocalFileOnDLQPublishFailed(tempDir, watermill.NopLogger{})
+
+	handler := dlq.Middleware(func(msg *message.Message) ([]*message.Message, error) {
+		return nil, handlerErr
+	})
+
+	msg := message.NewMessage(watermill.NewUUID(), []byte("payload"))
+	msg.Metadata.Set("X-Custom", "custom-value")
+
+	produced, err := handler(msg)
+
+	require.NoError(t, err)
+	require.Len(t, produced, 1)
+
+	savedPath := produced[0].Metadata.Get(DLQLocalFilePathKey)
+	assert.NotEmpty(t, savedPath)
+	assert.Contains(t, savedPath, tempDir)
+
+	info, err := os.Stat(savedPath)
+	require.NoError(t, err, "saved file should exist")
+	assert.False(t, info.IsDir())
+
+	content, err := os.ReadFile(savedPath)
+	require.NoError(t, err)
+	assert.Contains(t, string(content), "handler failed")
+	assert.Contains(t, string(content), "dlq publish failed")
+	assert.Contains(t, string(content), "custom-value")
+	assert.Contains(t, string(content), msg.UUID)
+}
+
+func TestDeadLetterQueue_LocalFileOnDLQPublishFailed_EmptyDir(t *testing.T) {
+	handlerErr := errors.New("handler failed")
+	dlqPublishErr := errors.New("dlq publish failed")
+	pub := &failingPublisher{err: dlqPublishErr}
+
+	dlq := NewDeadLetterQueue(pub, "dlq-topic", watermill.NopLogger{})
+	dlq.OnDLQPublishFailed = LocalFileOnDLQPublishFailed("", watermill.NopLogger{})
+
+	handler := dlq.Middleware(func(msg *message.Message) ([]*message.Message, error) {
+		return nil, handlerErr
+	})
+
+	msg := message.NewMessage(watermill.NewUUID(), []byte("payload"))
+
+	produced, err := handler(msg)
+	require.NoError(t, err)
+	require.Len(t, produced, 1)
+
+	savedPath := produced[0].Metadata.Get(DLQLocalFilePathKey)
+	assert.NotEmpty(t, savedPath)
+
+	assert.Contains(t, savedPath, filepath.Join("watermill-dlq-fallback"),
+		"empty dir should fallback to os.TempDir()/watermill-dlq-fallback")
+}
+
+func TestDeadLetterQueue_NewWithLocalFallback(t *testing.T) {
+	tempDir := t.TempDir()
+	pub := &failingPublisher{err: errors.New("down")}
+
+	dlq := NewDeadLetterQueueWithLocalFallback(pub, "dlq-topic", tempDir, watermill.NopLogger{})
+
+	assert.Equal(t, tempDir, dlq.LocalFallbackDir)
+	assert.NotNil(t, dlq.OnDLQPublishFailed)
+
+	handler := dlq.Middleware(func(msg *message.Message) ([]*message.Message, error) {
+		return nil, errors.New("boom")
+	})
+	msg := message.NewMessage(watermill.NewUUID(), []byte("payload"))
+	produced, err := handler(msg)
+	require.NoError(t, err)
+	assert.Len(t, produced, 1)
 }
 
 type mockPublisher struct {
