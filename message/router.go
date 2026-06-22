@@ -352,6 +352,44 @@ func (r *Router) AddConsumerHandler(
 	return r.AddHandler(handlerName, subscribeTopic, subscriber, "", disabledPublisher{}, handlerFuncAdapter)
 }
 
+// AddHandlerWithFallback adds a new handler with a fallback handler.
+// The fallback handler is executed when the original handler returns an error.
+//
+// handlerName must be unique. For now, it is used only for debugging.
+//
+// subscribeTopic is a topic from which handler will receive messages.
+//
+// publishTopic is a topic to which router will produce messages returned by handlerFunc.
+//
+// fallbackHandlerFunc is executed when handlerFunc returns an error.
+// If fallbackHandlerFunc succeeds, its produced messages will be published and the message will be acked.
+func (r *Router) AddHandlerWithFallback(
+	handlerName string,
+	subscribeTopic string,
+	subscriber Subscriber,
+	publishTopic string,
+	publisher Publisher,
+	handlerFunc HandlerFunc,
+	fallbackHandlerFunc HandlerFunc,
+) *Handler {
+	handler := r.AddHandler(handlerName, subscribeTopic, subscriber, publishTopic, publisher, handlerFunc)
+	handler.SetFallbackHandler(fallbackHandlerFunc)
+	return handler
+}
+
+// AddConsumerHandlerWithFallback adds a new consumer handler with a fallback handler.
+func (r *Router) AddConsumerHandlerWithFallback(
+	handlerName string,
+	subscribeTopic string,
+	subscriber Subscriber,
+	handlerFunc NoPublishHandlerFunc,
+	fallbackHandlerFunc NoPublishHandlerFunc,
+) *Handler {
+	handler := r.AddConsumerHandler(handlerName, subscribeTopic, subscriber, handlerFunc)
+	handler.SetFallbackConsumerHandler(fallbackHandlerFunc)
+	return handler
+}
+
 // AddNoPublisherHandler adds a new handler.
 // This handler cannot return messages.
 //
@@ -627,7 +665,8 @@ type handler struct {
 	publishTopic  string
 	publisherName string
 
-	handlerFunc HandlerFunc
+	handlerFunc         HandlerFunc
+	fallbackHandlerFunc HandlerFunc
 
 	runningHandlersWg     *sync.WaitGroup
 	runningHandlersWgLock *sync.Mutex
@@ -649,12 +688,22 @@ func (h *handler) run(ctx context.Context, middlewares []middleware) {
 	})
 
 	middlewareHandler := h.handlerFunc
-	// first added middlewares should be executed first (so should be at the top of call stack)
 	for i := len(middlewares) - 1; i >= 0; i-- {
 		currentMiddleware := middlewares[i]
 		isValidHandlerLevelMiddleware := currentMiddleware.HandlerName == h.name
 		if currentMiddleware.IsRouterLevel || isValidHandlerLevelMiddleware {
 			middlewareHandler = currentMiddleware.Handler(middlewareHandler)
+		}
+	}
+
+	middlewareFallbackHandler := h.fallbackHandlerFunc
+	if middlewareFallbackHandler != nil {
+		for i := len(middlewares) - 1; i >= 0; i-- {
+			currentMiddleware := middlewares[i]
+			isValidHandlerLevelMiddleware := currentMiddleware.HandlerName == h.name
+			if currentMiddleware.IsRouterLevel || isValidHandlerLevelMiddleware {
+				middlewareFallbackHandler = currentMiddleware.Handler(middlewareFallbackHandler)
+			}
 		}
 	}
 
@@ -665,7 +714,7 @@ func (h *handler) run(ctx context.Context, middlewares []middleware) {
 		h.runningHandlersWg.Add(1)
 		h.runningHandlersWgLock.Unlock()
 
-		go h.handleMessage(msg, middlewareHandler)
+		go h.handleMessage(msg, middlewareHandler, middlewareFallbackHandler)
 	}
 
 	if h.publisher != nil {
@@ -683,6 +732,16 @@ func (h *handler) run(ctx context.Context, middlewares []middleware) {
 type Handler struct {
 	router  *Router
 	handler *handler
+}
+
+func (h *Handler) SetFallbackHandler(fallbackHandler HandlerFunc) {
+	h.handler.fallbackHandlerFunc = fallbackHandler
+}
+
+func (h *Handler) SetFallbackConsumerHandler(fallbackHandler NoPublishHandlerFunc) {
+	h.handler.fallbackHandlerFunc = func(msg *Message) ([]*Message, error) {
+		return nil, fallbackHandler(msg)
+	}
 }
 
 // AddMiddleware adds new middleware to the specified handler in the router.
@@ -814,7 +873,7 @@ func (h *handler) handleClose(ctx context.Context) {
 	h.stopFn()
 }
 
-func (h *handler) handleMessage(msg *Message, handler HandlerFunc) {
+func (h *handler) handleMessage(msg *Message, handler HandlerFunc, fallbackHandler HandlerFunc) {
 	defer h.runningHandlersWg.Done()
 	msgFields := watermill.LogFields{"message_uuid": msg.UUID, "handler_name": h.name}
 
@@ -833,6 +892,37 @@ func (h *handler) handleMessage(msg *Message, handler HandlerFunc) {
 
 	producedMessages, err := handler(msg)
 	if err != nil {
+		if fallbackHandler != nil {
+			if !errors.Is(err, context.Canceled) {
+				h.logger.Info("Handler returned error, executing fallback handler", watermill.LogFields{
+					"message_uuid": msg.UUID,
+					"handler_name": h.name,
+					"error":        err.Error(),
+				})
+			}
+
+			fallbackProducedMessages, fallbackErr := fallbackHandler(msg)
+			if fallbackErr != nil {
+				if !errors.Is(fallbackErr, context.Canceled) {
+					h.logger.Error("Fallback handler also returned error", fallbackErr, msgFields)
+				}
+				msg.Nack()
+				return
+			}
+
+			h.addHandlerContext(fallbackProducedMessages...)
+
+			if err := h.publishProducedMessages(fallbackProducedMessages, msgFields); err != nil {
+				h.logger.Error("Publishing fallback produced messages failed", err, nil)
+				msg.Nack()
+				return
+			}
+
+			msg.Ack()
+			h.logger.Trace("Fallback handler succeeded, message acked", msgFields)
+			return
+		}
+
 		if !errors.Is(err, context.Canceled) {
 			h.logger.Error("Handler returned error", err, msgFields)
 		}

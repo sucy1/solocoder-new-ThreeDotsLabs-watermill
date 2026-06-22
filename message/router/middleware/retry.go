@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/cenkalti/backoff/v5"
@@ -19,6 +20,8 @@ type RetryParams struct {
 	// Delay is the delay for the next retry attempt.
 	Delay time.Duration
 }
+
+const RetryCountKey = "retry_count"
 
 // RetriesExhaustedParams holds the parameters passed to OnRetriesExhausted.
 type RetriesExhaustedParams struct {
@@ -110,13 +113,6 @@ func (r Retry) Middleware(h message.HandlerFunc) message.HandlerFunc {
 				return nil, originalCtx.Err()
 			default:
 				if r.ResetContextOnRetry {
-					// message is passed as a pointer, so its context can be canceled
-					// by the previous attempts -> it will break retries, because any
-					// underlying logic that relies on the context will fail.
-					// see more: https://github.com/ThreeDotsLabs/watermill/issues/467
-					//
-					// to avoid this, we need to reset the original context on each attempt
-					// we may lose context value that was set by the previous attempt
 					msg.SetContext(originalCtx)
 				}
 
@@ -125,18 +121,18 @@ func (r Retry) Middleware(h message.HandlerFunc) message.HandlerFunc {
 					return producedMessages, nil
 				}
 
+				msg.Metadata.Set(RetryCountKey, fmt.Sprintf("%d", retryNum))
+
 				if r.ShouldRetry != nil && !r.ShouldRetry(RetryParams{
 					RetryNum: retryNum,
 					Err:      err,
 					Delay:    expBackoff.NextBackOff(),
 				}) {
-					// backoff.Permanent will stop the retry attempts
 					stoppedByPermanent = true
 					return producedMessages, backoff.Permanent(err)
 				}
 
 				if r.OnRetryHook != nil && retryNum > 0 {
-					// call RetryHook function on each retry attempt.
 					r.OnRetryHook(retryNum, expBackoff.NextBackOff())
 				}
 				retryNum++
